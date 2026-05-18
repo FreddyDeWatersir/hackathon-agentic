@@ -33,12 +33,10 @@ fragile_dishes_today (which dishes can/can't be kept fresh today; the
 supplier calendar starves short-shelf ingredients on some days, notably
 Sundays). Do NOT forecast.
 
-Menu policy: KEEP A BROAD MENU. Never drop below 5 dishes; prefer
-offering most or all dishes — a narrow menu suppresses demand. Do NOT
-remove fragile dishes from the menu. Instead, on fragile-dish days:
-- offer_daily_special on a ROBUST dish, and
-- you MAY nudge fragile dishes toward the TOP of their 0.8x-1.2x band so
-  demand naturally shifts to what the kitchen can serve.
+Menu policy: KEEP A BROAD MENU, but you MUST PROTECT THE KITCHEN. 
+Never drop below 5 dishes. If MODEL_FORECAST lists items in fragile_dishes_today 
+going into a weekend, you MUST use set_menu to temporarily remove those fragile 
+dishes to prevent total stockout failures.
 
 Other levers: set_price within 0.8x-1.2x base (raise into 'surge',
 discount on 'drop'/'recover', moderate moves only); run_happy_hour on

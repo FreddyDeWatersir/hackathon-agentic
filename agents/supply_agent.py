@@ -247,7 +247,12 @@ def propose(obs: dict, day: int, by_dish: dict[str, float], budget: float,
         _eff, supplier, price, min_order, latency, gap = entry
         on_hand = inv_kg.get(ing, 0.0) + pending.get(ing, 0.0)
 
-        coverage_target = latency + gap + REORDER_BUFFER_DAYS + SAFETY_DAYS
+        # Add dynamic safety buffer for notoriously fragile ingredients
+        item_safety_days = SAFETY_DAYS
+        if ing in {"Salmon", "Fresh Pasta", "Mozzarella", "Lettuce"}:
+            item_safety_days += 1.5  # Extra 1.5 days of buffer for risky items
+
+        coverage_target = latency + gap + REORDER_BUFFER_DAYS + item_safety_days
         if on_hand >= rate * coverage_target:
             continue
 

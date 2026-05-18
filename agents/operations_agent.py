@@ -72,13 +72,12 @@ def propose(obs: dict, day: int, expected_covers: float,
         NO_SERVICE_ABS, NO_SERVICE_FRAC * float(expected_covers))
 
     if no_service:
-        # Walkouts here mean NO FOOD, not slow service. Staffing up burns
-        # cash for nothing — go straight to minimum (bypass the down-step
-        # limit; conserving cash now is urgent).
-        target = MIN_STAFF
-        risk = "high"
-        reason = (f"covers≈{covers_yest:.0f}: supply/menu failure, NOT "
-                  f"understaffing — going lean to conserve cash")
+        # Walkouts yesterday meant NO FOOD. Today, demand returns.
+        # Staff for today's forecast, not yesterday's failure.
+        target = demand_target
+        risk = "med"
+        reason = (f"covers≈{covers_yest:.0f}: supply/menu failure yesterday, "
+                  f"recovering staff for forecast {expected_covers:.0f}")
     elif walkout in ("Some", "Many") or peak_wait > PEAK_WAIT_BAD or bottleneck:
         # Genuine load: we WERE serving and still hit limits.
         target = max(demand_target, cur + 1)

@@ -78,7 +78,7 @@ class Memory:
 
     # ---------- demand model ----------
     def _fc_max(self) -> float:
-        return max(300.0, 1.8 * self.peak)
+        return max(300.0, 1.15 * self.peak)
 
     def forecast(self, weekday: int, weather: str | None) -> float:
         base = self.wd_base.get(str(weekday)) or self.lvl or P0
