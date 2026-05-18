@@ -1,14 +1,14 @@
-"""supply_agent.py — deterministic procurement specialist (v3).
+"""supply_agent.py — deterministic procurement specialist (v5).
 
-v3 adds the only thing memory changes here: when memory reports the
-demand regime is ramp/surge/recover, supply PRE-POSITIONS perishables —
-it relaxes the shelf-life waste cap and treats every needed ingredient
-as critical (always at least the supplier minimum), accepting some
-spoilage because a stockout *during a surge* costs vastly more than
-waste. In a stable/drop regime it behaves exactly as v2 (waste-tight).
+v5 regression fix: the sourceability oracle (#2 back-channel) now takes
+the INTRINSIC shelf life as an explicit input (learned & persisted by
+memory) instead of reading shelf_life_days from current inventory, where
+a depleted entry reports 0 and made the oracle mark every dish fragile.
+fresh_feasible / dish_sourceability / propose accept an optional
+`shelf` override; the coordinator passes memory's learned map.
 
-Everything else (recipe-exact requirements, yesterday-sales floor,
-delivery-aware sizing, visible at_risk) is unchanged from v2.
+Ordering logic and the oracle's structural definition are otherwise
+unchanged from v4.
 """
 from __future__ import annotations
 
@@ -35,6 +35,8 @@ class SupplyResult:
     at_risk: list[str] = field(default_factory=list)
     expiring_soon: dict[str, float] = field(default_factory=dict)
     budget_left: float = 0.0
+    robust_dishes: list[str] = field(default_factory=list)
+    fragile_dishes: list[str] = field(default_factory=list)
 
 
 REORDER_BUFFER_DAYS = 2.0
@@ -47,9 +49,68 @@ LATE_PENALTY = 0.20
 LATENCY_PENALTY = 0.04
 EXPIRY_WARN_DAYS = 2
 PREPOSITION_REGIMES = {"ramp", "surge", "recover"}
-PREPOSITION_CAP_FACTOR = 2.0   # how far past the shelf-life cap we'll go
+PREPOSITION_CAP_FACTOR = 2.0
+DEFAULT_SHELF = 7.0
 
 
+# ---- sourceability oracle (deterministic; intrinsic shelf life) ----------
+def _ingredient_shelf(obs: dict, override: dict | None = None) -> dict:
+    if override:
+        return dict(override)
+    # Fallback only: trust shelf_life_days only when sane (>0); a depleted
+    # entry's 0 is ignored so it can't poison feasibility.
+    d = {}
+    for i in obs.get("inventory", []) or []:
+        try:
+            sd = float(i.get("shelf_life_days"))
+        except (TypeError, ValueError):
+            continue
+        if i.get("ingredient") and sd > 0:
+            d[i["ingredient"]] = sd
+    return d
+
+
+def _ingredient_delivery_weekdays(obs: dict) -> dict:
+    out: dict = {}
+    for sup in obs.get("supplier_catalog", []) or []:
+        wds = {_WEEKDAYS[w.strip().lower()]
+               for w in sup.get("delivery_days", []) or []
+               if str(w).strip().lower() in _WEEKDAYS}
+        for ing in (sup.get("ingredients", {}) or {}):
+            out.setdefault(ing, set()).update(wds)
+    return out
+
+
+def fresh_feasible(obs: dict, shelf: dict | None = None) -> dict:
+    sh = _ingredient_shelf(obs, shelf)
+    dwd = _ingredient_delivery_weekdays(obs)
+    out: dict = {}
+    for ing, days in dwd.items():
+        s = sh.get(ing, DEFAULT_SHELF)
+        feas = set()
+        for w in range(7):
+            min_age = min(((w - d) % 7) for d in days) if days else 99
+            if min_age < s:
+                feas.add(w)
+        out[ing] = feas
+    return out
+
+
+def dish_sourceability(obs: dict, weekday: int,
+                       shelf: dict | None = None) -> tuple[set, set]:
+    feas = fresh_feasible(obs, shelf)
+    robust, fragile = set(), set()
+    for m in obs.get("menu_book", []) or []:
+        name = m.get("name")
+        if not name:
+            continue
+        ings = [c.get("ingredient") for c in m.get("ingredients", []) or []]
+        ok = all(weekday in feas.get(ing, set(range(7))) for ing in ings)
+        (robust if ok else fragile).add(name)
+    return robust, fragile
+
+
+# --------------------------------------------------------------------------
 def _effective_by_dish(obs: dict, by_dish: dict[str, float]) -> dict[str, float]:
     valid = {m.get("name") for m in obs.get("menu_book", []) or []}
     eff = {k: float(v) for k, v in by_dish.items() if k in valid}
@@ -86,8 +147,8 @@ def _supplier_strikes(obs: dict) -> dict[str, int]:
     return strikes
 
 
-def _alerted_suppliers(obs: dict) -> set[str]:
-    bad: set[str] = set()
+def _alerted_suppliers(obs: dict) -> set:
+    bad = set()
     alerts = " ".join(str(a) for a in obs.get("alerts", []) or []).lower()
     for sup in obs.get("supplier_catalog", []) or []:
         nm = sup.get("name", "")
@@ -119,16 +180,19 @@ def _delivery_gap(sup: dict) -> float:
     return float(max(gaps))
 
 
-def propose(obs: dict, day: int, by_dish: dict[str, float],
-            budget: float, regime: str = "stable") -> SupplyResult:
+def propose(obs: dict, day: int, by_dish: dict[str, float], budget: float,
+            regime: str = "stable", shelf: dict | None = None) -> SupplyResult:
     res = SupplyResult(budget_left=float(budget))
     today_wd = _weekday_index(obs, day)
+    r, f = dish_sourceability(obs, today_wd, shelf)
+    res.robust_dishes, res.fragile_dishes = sorted(r), sorted(f)
+
     prepos = regime in PREPOSITION_REGIMES
 
     inv_kg = {i["ingredient"]: float(i.get("total_kg", 0.0))
               for i in obs.get("inventory", []) or []}
-    shelf = {i["ingredient"]: float(i.get("shelf_life_days", 7))
-             for i in obs.get("inventory", []) or []}
+    inv_shelf = {i["ingredient"]: float(i.get("shelf_life_days", 7) or 7)
+                 for i in obs.get("inventory", []) or []}
 
     pending: dict[str, float] = {}
     for po in obs.get("pending_orders", []) or []:
@@ -188,13 +252,12 @@ def propose(obs: dict, day: int, by_dish: dict[str, float],
             continue
 
         need = rate * coverage_target - on_hand
-        # Pre-position during a surge: allow building past the shelf cap.
         cap_factor = PREPOSITION_CAP_FACTOR if prepos else 1.0
-        usable_room = max(rate * min(shelf.get(ing, 7.0), MAX_DAYS_ON_HAND)
+        sl = (shelf or {}).get(ing, inv_shelf.get(ing, 7.0)) or 7.0
+        usable_room = max(rate * min(sl, MAX_DAYS_ON_HAND)
                           * cap_factor - on_hand, 0.0)
         qty = min(need, usable_room)
 
-        # In a surge regime treat everything as critical (keep pipeline full).
         critical = prepos or cover < CRITICAL_COVER_DAYS
         if qty < min_order:
             if critical:
