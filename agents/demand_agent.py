@@ -16,9 +16,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 
 import litellm
+
+from agents import memory as mem
 
 MODEL = os.getenv("AGENT_MODEL", "openai/gpt-4.1-mini")
 
@@ -33,6 +36,10 @@ Hard rules:
 - Reputation is sticky and walkouts compound: do not chase volume you
   cannot serve. Modest, steady demand beats spiky demand.
 - A dish whose ingredient is about to expire is a good daily_special pick.
+- Use dow_cover_avg (historical covers by day-of-week) to calibrate your
+  expected_covers forecast: if today is historically strong, forecast higher.
+- If happy_hour_streak >= 3, do NOT include run_happy_hour — effectiveness
+  has decayed and the critic will veto it anyway.
 
 Respond with ONLY this JSON object, no prose, no markdown:
 {
@@ -65,13 +72,26 @@ class DemandResult:
 
 
 def _persistence_forecast(obs: dict) -> tuple[float, dict[str, float]]:
-    """Fallback: assume tomorrow ≈ yesterday's realised dish mix."""
+    """Fallback: assume tomorrow ≈ yesterday's realised dish mix.
+
+    All active-menu dishes are always included with at least a small floor so
+    the supply agent maintains stock for every dish — not just the ones that
+    happened to sell yesterday (which collapses to a subset if some dishes ran
+    out of ingredients mid-service and got 0 sales).
+    """
     ss = obs.get("service_summary", {}) or {}
     sold = {k: float(v) for k, v in (ss.get("dishes_sold", {}) or {}).items()}
-    if sold:
-        return float(ss.get("total_covers", sum(sold.values()))), sold
-    # Day 1 / no history: spread a modest default over the active menu.
     active = obs.get("active_menu", []) or []
+    if sold:
+        total = sum(sold.values())
+        # Floor: every active dish gets at least 5 % of average-per-dish covers
+        # so supply never stops ordering for dishes that were temporarily zero.
+        floor = max(1.0, total / max(len(active), 1) * 0.05)
+        for dish in active:
+            if dish not in sold:
+                sold[dish] = floor
+        return float(ss.get("total_covers", total)), sold
+    # Day 1 / no history: spread a modest default over the active menu.
     if not active:
         return 0.0, {}
     each = 90.0 / len(active)
@@ -107,23 +127,33 @@ def _compact_observation(obs: dict) -> dict:
         ],
         "ingredient_min_expiry_days": inv_expiry,
         "alerts": obs.get("alerts"),
+        # Long-term memory: day-of-week cover averages and promotion streak.
+        "dow_cover_avg": mem.dow_cover_averages(),
+        "happy_hour_streak": mem.happy_hour_streak(),
     }
 
 
 def _call_llm(system: str, user: str) -> dict | None:
     if not (os.environ.get("OPENAI_API_KEY")
-            or os.environ.get("ANTHROPIC_API_KEY")):
+            or os.environ.get("ANTHROPIC_API_KEY")
+            or os.environ.get("GEMINI_API_KEY")):
         return None
+        
     try:
         resp = litellm.completion(
             model=MODEL, temperature=0.3, max_tokens=1200,
-            messages=[{"role": "system", "content": system},
+            response_format={"type": "json_object"},
+            messages=[{"role": "system", "content": system + "\nOutput exactly valid JSON without trailing commas."},
                       {"role": "user", "content": user}])
         txt = resp.choices[0].message.content.strip()
         if txt.startswith("```"):
             txt = txt.split("\n", 1)[1].rsplit("```", 1)[0].strip()
             if txt.startswith("json"):
                 txt = txt[4:].strip()
+                
+        txt = re.sub(r',\s*\}', '}', txt)
+        txt = re.sub(r',\s*\]', ']', txt)
+
         return json.loads(txt)
     except Exception as e:
         print(f"  [demand] LLM fallback: {e}")

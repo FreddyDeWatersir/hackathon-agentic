@@ -1,18 +1,39 @@
-"""supply_agent.py — deterministic procurement specialist.
+"""supply_agent.py — hybrid deterministic + LLM-advised procurement.
 
-Serves the coordinator. Owns ONLY place_order.
+The deterministic engine is the source of truth: it does recipe math,
+supplier scoring, budget enforcement, shelf-life caps, and the existing
+cold-start/weekend/stockout boosts. The LLM is an ADVISOR that returns
+coverage_days boosts (same units the deterministic layers already use).
+The math layer then validates everything (shelf cap, budget, min order)
+exactly as before.
 
-Given the demand agent's per-dish forecast, it computes the EXACT kg of
-each ingredient needed (recipes carry quantity_kg), sizes orders to bridge
-the real supply gap (lead time + delivery-day cadence), caps by shelf life
-so it doesn't manufacture waste, picks the most reliable affordable
-supplier, and never exceeds the budget the coordinator hands it.
+A misbehaving LLM can only nudge targets within clamped ranges, never
+break the math. If the LLM is unavailable or returns garbage, boosts
+default to 0 and the deterministic flow runs exactly as before.
 
-Stateless: every signal it needs is in the observation each turn.
+COVERAGE_DAYS LAYERS (applied in order, then capped by shelf life):
+  1. Base: latency + gap + REORDER_BUFFER_DAYS + SAFETY_DAYS
+  2. LLM global_boost: situational adjustment for ALL ingredients
+  3. LLM ingredient_boosts[ing]: per-ingredient adjustment
+  4. Cold start (day ≤ 5): +1.5
+  5. Weekend pre-loading (Wed/Thu/Fri/Sat)
+  6. Stockout feedback (yesterday's unavailable dishes): +1.0
+
+Stateless aside from a per-day cache that prevents a duplicate LLM call
+when the critic re-runs supply with an updated budget.
 """
 from __future__ import annotations
 
+import json
+import os
+import re
 from dataclasses import dataclass, field
+
+import litellm
+
+from agents import memory as mem
+
+MODEL = os.getenv("AGENT_MODEL", "openai/gpt-4.1-mini")
 
 _WEEKDAYS = {
     "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
@@ -31,23 +52,164 @@ def _weekday_index(obs: dict, day: int) -> int:
 @dataclass
 class SupplyResult:
     actions: list[dict] = field(default_factory=list)
-    requirements: dict[str, float] = field(default_factory=dict)   # kg/day
+    requirements: dict[str, float] = field(default_factory=dict)
     spend: float = 0.0
-    at_risk: list[str] = field(default_factory=list)               # couldn't cover
-    expiring_soon: dict[str, float] = field(default_factory=dict)  # kg wasting
+    at_risk: list[str] = field(default_factory=list)
+    expiring_soon: dict[str, float] = field(default_factory=dict)
     budget_left: float = 0.0
 
 
-# --- Tunables --------------------------------------------------------------
-REORDER_BUFFER_DAYS = 2.0   # slack on top of the delivery gap
-SAFETY_DAYS = 1.0           # extra cover for demand variance
-MAX_DAYS_ON_HAND = 7.0      # hard ceiling on stock depth (waste guard)
+# --- Deterministic tunables -------------------------------------------------
+REORDER_BUFFER_DAYS = 2.0
+SAFETY_DAYS = 1.0
+MAX_DAYS_ON_HAND = 7.0
 DEFAULT_LEAD_DAYS = 2
 DEFAULT_GAP_DAYS = 3.0
-LATE_PENALTY = 0.20         # effective-cost bump per recent shortfall/late
-LATENCY_PENALTY = 0.04      # effective-cost bump per day until delivery
-EXPIRY_WARN_DAYS = 2        # flag stock expiring within this many days
-LOW_COVER_DAYS = 2.0        # ingredient is "at risk" below this much cover
+LATE_PENALTY = 0.20
+LATENCY_PENALTY = 0.04
+EXPIRY_WARN_DAYS = 2
+LOW_COVER_DAYS = 2.0
+COLD_START_DAYS = 5
+COLD_START_BOOST = 1.5
+STOCKOUT_FEEDBACK_BOOST = 1.0
+
+# --- LLM advisory tunables --------------------------------------------------
+LLM_GLOBAL_BOOST_MIN, LLM_GLOBAL_BOOST_MAX = -2.0, 3.0
+LLM_PER_ING_BOOST_MIN, LLM_PER_ING_BOOST_MAX = -3.0, 5.0
+MIN_COVERAGE_FLOOR = 0.5  # combined boosts can't zero out coverage
+
+SUPPLY_LLM_SYSTEM = """\
+You are the procurement strategist for a 22-table Italian restaurant in a
+30-day survival game. A deterministic engine already handles recipe math,
+supplier scoring, budget enforcement, and shelf-life caps. Your only job:
+return coverage_days BOOSTS (additive, in days) that nudge the engine's
+target stock up or down for situations the math cannot see.
+
+WHEN TO NUDGE (each suggestion is roughly 0.5-1.5 days of boost):
+- End-game: days_remaining <= 3 -> NEGATIVE global_boost to run inventory down.
+- Weather: storm/rain on a high-traffic day -> modest negative boost.
+- Weather: sunny weekend ahead -> positive boost anticipating higher demand.
+- Alerts naming a supplier or ingredient -> boost alternatives BEFORE the hit.
+- Demand trend: recent_5_days clearly accelerating -> positive global_boost.
+- A specific dish repeatedly running out (across multiple days) -> positive
+  ingredient_boost on that dish's ingredients.
+- Reputation_band dropped to "Fair" or worse -> negative (demand will drop).
+
+WHAT THE ENGINE ALREADY DOES (do NOT duplicate these):
+- Cold-start buffer in first 5 days (+1.5 days automatically)
+- Weekend pre-loading on Wed/Thu/Fri/Sat
+- Stockout feedback on YESTERDAY's unavailable dishes (+1.0 day already applied)
+- Supplier reliability scoring (penalises shortfalls and outages)
+
+OUTPUT (only this JSON, no prose, no markdown fences):
+{
+  "global_boost": 0.0,
+  "ingredient_boosts": {"Ingredient Name": 0.0},
+  "reasoning": "one short sentence on what specifically triggered the boost"
+}
+
+CLAMPS: global_boost in [-2, +3], each ingredient_boost in [-3, +5].
+
+DEFAULT to all zeros. The deterministic engine is well-tuned; you should
+return zeros on most days. Only override when you see a specific signal
+the engine can't (weather, alerts, trend, reputation, end-game)."""
+
+
+# --- Per-day cache so the critic-triggered re-run skips a duplicate call ---
+_LLM_ADVICE_CACHE: dict[int, dict] = {}
+
+
+def _call_supply_llm(obs: dict, day: int, by_dish: dict[str, float],
+                     requirements: dict[str, float]) -> dict:
+    """Ask the LLM for coverage_days boosts. Returns {} if unavailable or
+    on any error. Cached per day to avoid double-calls during critic re-runs."""
+    global _LLM_ADVICE_CACHE
+    # Reset cache at game start (same Python process may run multiple games).
+    if day == 1:
+        _LLM_ADVICE_CACHE = {}
+    if day in _LLM_ADVICE_CACHE:
+        return _LLM_ADVICE_CACHE[day]
+
+    if not (os.environ.get("OPENAI_API_KEY")
+            or os.environ.get("ANTHROPIC_API_KEY")
+            or os.environ.get("GEMINI_API_KEY")):
+        _LLM_ADVICE_CACHE[day] = {}
+        return {}
+
+    ss = obs.get("service_summary", {}) or {}
+    payload = {
+        "day": day,
+        "day_of_week": obs.get("day_of_week"),
+        "days_remaining": obs.get("days_remaining"),
+        "cash": obs.get("cash"),
+        "weather_today": obs.get("weather_today"),
+        "weather_forecast": obs.get("weather_forecast"),
+        "alerts": obs.get("alerts"),
+        "yesterday_covers": ss.get("total_covers"),
+        "yesterday_walkout_band": ss.get("walkout_band"),
+        "yesterday_dishes_unavailable_at": ss.get("dishes_unavailable_at") or {},
+        "reputation_band": obs.get("reputation_band"),
+        "customer_trend": obs.get("customer_trend"),
+        "forecast_covers_today": round(sum(by_dish.values()), 1),
+        "forecast_by_dish": {k: round(v, 1) for k, v in by_dish.items()},
+        "active_ingredients": sorted(requirements.keys()),
+        "dow_cover_averages": mem.dow_cover_averages(),
+        "recent_5_days": [
+            {"d": e["day"], "dow": e.get("covers_dow"), "cov": e["covers"]}
+            for e in mem.get_recent(5)
+        ],
+    }
+
+    try:
+        resp = litellm.completion(
+            model=MODEL, temperature=0.2, max_tokens=500,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system",
+                 "content": SUPPLY_LLM_SYSTEM +
+                 "\nOutput exactly valid JSON without trailing commas."},
+                {"role": "user", "content": json.dumps(payload)},
+            ])
+        txt = resp.choices[0].message.content.strip()
+        if txt.startswith("```"):
+            txt = txt.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            if txt.startswith("json"):
+                txt = txt[4:].strip()
+        txt = re.sub(r',\s*\}', '}', txt)
+        txt = re.sub(r',\s*\]', ']', txt)
+        result = json.loads(txt)
+        if not isinstance(result, dict):
+            result = {}
+        _LLM_ADVICE_CACHE[day] = result
+        return result
+    except Exception as e:
+        print(f"  [supply] LLM fallback: {e}")
+        _LLM_ADVICE_CACHE[day] = {}
+        return {}
+
+
+def _parse_llm_boosts(advice: dict) -> tuple[float, dict[str, float]]:
+    """Extract and clamp boosts from LLM advice. Returns (0.0, {}) on garbage."""
+    try:
+        global_boost = float(advice.get("global_boost", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        global_boost = 0.0
+    global_boost = max(LLM_GLOBAL_BOOST_MIN,
+                       min(LLM_GLOBAL_BOOST_MAX, global_boost))
+
+    per_ing_raw = advice.get("ingredient_boosts") or {}
+    per_ing: dict[str, float] = {}
+    if isinstance(per_ing_raw, dict):
+        for k, v in per_ing_raw.items():
+            if not isinstance(k, str):
+                continue
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            per_ing[k] = max(LLM_PER_ING_BOOST_MIN,
+                             min(LLM_PER_ING_BOOST_MAX, f))
+    return global_boost, per_ing
 
 
 def _daily_requirements(obs: dict, by_dish: dict[str, float]) -> dict[str, float]:
@@ -64,6 +226,18 @@ def _daily_requirements(obs: dict, by_dish: dict[str, float]) -> dict[str, float
             if ing:
                 req[ing] = req.get(ing, 0.0) + kg
     return req
+
+
+def _ingredients_of(obs: dict, dish_names: set[str]) -> set[str]:
+    """Return the set of ingredient names that appear in the given dishes."""
+    out: set[str] = set()
+    for recipe in obs.get("menu_book", []) or []:
+        if recipe.get("name") in dish_names:
+            for comp in recipe.get("ingredients", []) or []:
+                ing = comp.get("ingredient")
+                if ing:
+                    out.add(ing)
+    return out
 
 
 def _supplier_strikes(obs: dict) -> dict[str, int]:
@@ -119,8 +293,21 @@ def propose(obs: dict, day: int, by_dish: dict[str, float],
 
     inv_kg = {i["ingredient"]: float(i.get("total_kg", 0.0))
               for i in obs.get("inventory", []) or []}
-    shelf = {i["ingredient"]: float(i.get("shelf_life_days", 7))
-             for i in obs.get("inventory", []) or []}
+
+    # Shelf-life + batch-expiry maps. We use the MAX expires_in_days across
+    # batches as a proxy for fresh-delivery shelf life (floored at 3 so we
+    # never refuse to stock an ingredient entirely).
+    shelf: dict[str, float] = {}
+    expiry_by_batch: dict[str, list[tuple[float, float]]] = {}
+    for i in obs.get("inventory", []) or []:
+        ing = i["ingredient"]
+        batches = i.get("batches", []) or []
+        pairs = [(float(b.get("quantity_kg", 0.0)),
+                  float(b.get("expires_in_days", 99) or 99))
+                 for b in batches]
+        expiry_by_batch[ing] = pairs
+        max_exp = max((exp for _, exp in pairs), default=0.0)
+        shelf[ing] = max(max_exp, 3.0)
 
     # Pending counts as incoming stock so we never double-order.
     pending: dict[str, float] = {}
@@ -139,6 +326,25 @@ def propose(obs: dict, day: int, by_dish: dict[str, float],
 
     req = _daily_requirements(obs, by_dish)
     res.requirements = {k: round(v, 2) for k, v in req.items()}
+
+    # Stockout feedback set: ingredients in dishes that ran out yesterday.
+    ss_for_stockout = obs.get("service_summary", {}) or {}
+    unavailable_dishes = set((ss_for_stockout.get("dishes_unavailable_at") or {}).keys())
+    stockout_ingredients = _ingredients_of(obs, unavailable_dishes)
+
+    # ---- LLM advisory (cached per-day) ---------------------------------
+    # The LLM returns additive coverage_days boosts for situations the
+    # deterministic layers can't see — weather, alerts, demand trends,
+    # end-game, reputation drops. Output is clamped here, so a bad response
+    # can only nudge targets a few days in either direction.
+    llm_advice = _call_supply_llm(obs, day, by_dish, req)
+    llm_global, llm_per_ing = _parse_llm_boosts(llm_advice)
+    if (llm_global != 0.0 or llm_per_ing) and llm_advice.get("reasoning"):
+        rounded_ing = {k: round(v, 1) for k, v in llm_per_ing.items()}
+        boost_str = f"global={llm_global:+.1f}"
+        if rounded_ing:
+            boost_str += f", per-ing={rounded_ing}"
+        print(f"  [supply] LLM: {llm_advice['reasoning']} ({boost_str})")
 
     strikes = _supplier_strikes(obs)
     alerted = _alerted_suppliers(obs)
@@ -172,24 +378,60 @@ def propose(obs: dict, day: int, by_dish: dict[str, float],
     for cover, ing in ranked:
         entry = best.get(ing)
         if entry is None:
-            res.at_risk.append(ing)  # nobody sells it / all in outage
+            res.at_risk.append(ing)
             continue
         _eff, supplier, price, min_order, latency, gap = entry
         rate = req[ing]
         on_hand = inv_kg.get(ing, 0.0) + pending.get(ing, 0.0)
 
         coverage_days = latency + gap + REORDER_BUFFER_DAYS + SAFETY_DAYS
+
+        # LLM strategic adjustment (situations the math can't see).
+        coverage_days += llm_global
+        coverage_days += llm_per_ing.get(ing, 0.0)
+
+        # Cold start: first week needs extra buffer (no DOW history yet).
+        if day <= COLD_START_DAYS:
+            coverage_days += COLD_START_BOOST
+
+        # Weekend pre-loading around the Sunday closure.
+        if today_wd == 4:    # Friday → arrives Mon
+            coverage_days += 1.5
+        elif today_wd == 3:  # Thursday → last chance to fatten Sat (arrives Fri)
+            coverage_days += 1.5
+        elif today_wd == 2:  # Wednesday → also pre-stages Sat
+            coverage_days += 0.5
+        elif today_wd == 5:  # Saturday → pre-stage Mon-Tue (arrives Mon)
+            coverage_days += 0.5
+
+        # Stockout feedback: yesterday's missing dishes signal under-forecast.
+        if ing in stockout_ingredients:
+            coverage_days += STOCKOUT_FEEDBACK_BOOST
+
+        # Safety floor: never let combined boosts zero out coverage entirely.
+        coverage_days = max(MIN_COVERAGE_FLOOR, coverage_days)
+
         cap = rate * min(shelf.get(ing, 7.0), MAX_DAYS_ON_HAND)
         target = min(rate * coverage_days, cap)
 
-        qty = target - on_hand
+        # Stock that expires before delivery cannot be counted toward on-hand.
+        expiring_before_delivery = sum(
+            qty_b for qty_b, exp in expiry_by_batch.get(ing, [])
+            if exp < latency
+        )
+        effective_on_hand = max(0.0, on_hand - expiring_before_delivery)
+
+        qty = target - effective_on_hand
         if qty <= 0:
             continue
         if qty < min_order:
-            if min_order <= cap - on_hand:
+            on_hand_at_delivery = max(0.0, effective_on_hand - rate * latency)
+            if min_order <= cap - on_hand_at_delivery:
+                qty = min_order
+            elif cover < latency + gap:
                 qty = min_order
             else:
-                continue  # bumping to min_order would create waste
+                continue
 
         cost = qty * price
         if cost > res.budget_left:
