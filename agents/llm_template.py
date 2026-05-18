@@ -81,4 +81,4 @@ if __name__ == "__main__":
         print(f"Using model: {MODEL} (override with AGENT_MODEL env var)")
         sys.exit(1)
     print(f"Using model: {MODEL}")
-    result = run_game(strategy, team_name="llm_template", seed=42)
+    result = run_game(strategy, team_name="lets_try", seed=42)

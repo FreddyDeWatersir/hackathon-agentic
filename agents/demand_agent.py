@@ -1,16 +1,13 @@
-"""demand_agent.py — LLM-driven demand specialist.
+"""demand_agent.py — LLM-driven demand specialist (memory-aware).
 
-Serves the coordinator. Owns: set_price, set_menu, run_happy_hour,
-offer_daily_special. (Marketing spend is a budget item the coordinator
-emits; this agent only *requests* an amount.)
+Unchanged from before except: it now receives a compact MEMORY block
+(recent actual covers, its own forecast bias, the regime) so it can
+ground forecasts in the real trajectory instead of guessing from a
+single snapshot. This is the proximate fix for the chronic
+under-forecast that starves supply before the surge.
 
-Its second, equally important job: produce the demand FORECAST
-(expected_covers + per-dish mix) that supply and operations both consume.
-The forecast must reflect demand UNDER the actions it proposes.
-
-If the LLM is unavailable or returns garbage, it falls back to a
-persistence forecast (yesterday's dish mix) and makes no menu/price
-changes — safe, never crashes the game.
+Fallback unchanged: no key / bad JSON ⇒ persistence forecast, no
+menu/price changes, never crashes the game.
 """
 from __future__ import annotations
 
@@ -24,17 +21,22 @@ MODEL = os.getenv("AGENT_MODEL", "openai/gpt-4.1-mini")
 
 SYSTEM_PROMPT = """\
 You are the demand manager of a 22-table Italian restaurant in a 30-day
-survival game. You set prices, the active menu, happy hour, and the daily
-special to drive covers and revenue — and you forecast tomorrow's demand.
+survival game. You set prices, the active menu, happy hour, and the
+daily special — and you forecast tomorrow's demand.
+
+A MEMORY block gives you recent ACTUAL covers, your own forecast bias,
+and the current regime. Your forecast MUST be consistent with that
+trajectory: if recent actuals were ~100 and rising, do NOT forecast 18.
+If your bias says you under-forecast, scale up accordingly.
 
 Hard rules:
-- Prices must stay within 0.8x-1.2x each dish's base_price.
-- The active menu must have at least 5 dishes (use exact names).
-- Reputation is sticky and walkouts compound: do not chase volume you
-  cannot serve. Modest, steady demand beats spiky demand.
-- A dish whose ingredient is about to expire is a good daily_special pick.
+- Prices strictly INSIDE 0.8x-1.2x base (avoid the exact boundary).
+- Active menu ≥ 5 dishes (exact names).
+- Reputation is sticky and walkouts compound; don't chase volume you
+  cannot serve. A dish whose ingredient is about to expire is a good
+  daily_special pick.
 
-Respond with ONLY this JSON object, no prose, no markdown:
+Respond with ONLY this JSON, no prose, no markdown:
 {
   "actions": [
     {"tool": "set_price", "args": {"dish": "...", "price": 0.0}},
@@ -50,8 +52,7 @@ Respond with ONLY this JSON object, no prose, no markdown:
     "reasoning": "one short sentence"
   }
 }
-Only include actions you actually want to take. by_dish must cover every
-dish you expect to sell and sum roughly to expected_covers."""
+by_dish must cover every dish you expect to sell and sum ≈ expected_covers."""
 
 
 @dataclass
@@ -65,12 +66,10 @@ class DemandResult:
 
 
 def _persistence_forecast(obs: dict) -> tuple[float, dict[str, float]]:
-    """Fallback: assume tomorrow ≈ yesterday's realised dish mix."""
     ss = obs.get("service_summary", {}) or {}
     sold = {k: float(v) for k, v in (ss.get("dishes_sold", {}) or {}).items()}
     if sold:
         return float(ss.get("total_covers", sum(sold.values()))), sold
-    # Day 1 / no history: spread a modest default over the active menu.
     active = obs.get("active_menu", []) or []
     if not active:
         return 0.0, {}
@@ -79,7 +78,6 @@ def _persistence_forecast(obs: dict) -> tuple[float, dict[str, float]]:
 
 
 def _compact_observation(obs: dict) -> dict:
-    """Only what demand needs — keeps the prompt small and cheap."""
     inv_expiry = {
         i["ingredient"]: min((b.get("expires_in_days", 99)
                               for b in i.get("batches", []) or []), default=99)
@@ -92,7 +90,6 @@ def _compact_observation(obs: dict) -> dict:
         "days_remaining": obs.get("days_remaining"),
         "yesterday_revenue": obs.get("yesterday_revenue"),
         "yesterday_covers": ss.get("total_covers"),
-        "yesterday_dishes_sold": ss.get("dishes_sold"),
         "yesterday_walkout_band": ss.get("walkout_band"),
         "reputation_band": obs.get("reputation_band"),
         "customer_trend": obs.get("customer_trend"),
@@ -130,9 +127,10 @@ def _call_llm(system: str, user: str) -> dict | None:
         return None
 
 
-def propose(obs: dict, day: int) -> DemandResult:
-    user = (f"Day {day}/30. State:\n"
-            f"{json.dumps(_compact_observation(obs), indent=2)}")
+def propose(obs: dict, day: int, mem_summary: dict | None = None) -> DemandResult:
+    payload = {"MEMORY": mem_summary or {},
+               "OBSERVATION": _compact_observation(obs)}
+    user = f"Day {day}/30.\n{json.dumps(payload, indent=2)}"
     data = _call_llm(SYSTEM_PROMPT, user)
 
     fb_covers, fb_mix = _persistence_forecast(obs)
@@ -158,9 +156,7 @@ def propose(obs: dict, day: int) -> DemandResult:
         req_mkt = 0.0
 
     return DemandResult(
-        actions=actions,
-        expected_covers=ec,
-        by_dish=by_dish,
+        actions=actions, expected_covers=ec, by_dish=by_dish,
         confidence=str(fc.get("confidence", "low")),
         requested_marketing=max(0.0, min(500.0, req_mkt)),
         reasoning=str(fc.get("reasoning", "")),

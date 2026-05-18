@@ -1,16 +1,17 @@
-"""coordinator.py — LLM orchestrator + the strategy() entrypoint.
+"""coordinator.py — LLM orchestrator + strategy() entrypoint (memory-aware).
 
-Pipeline each day:
-  1. demand_agent (LLM)        → actions + forecast (covers, by_dish)
-  2. coordinator LLM           → cash arbitration: how much supply may
-                                 spend, final marketing, staffing risk bias
-  3. supply_agent (det.)       → orders, constrained by that budget
-  4. operations_agent (det.)   → staff level, using the forecast + bias
-  5. merge actions, coordinator writes the single save_notes blob
+Per day:
+  1. rebuild Memory from observation["notes"]; update it with yesterday
+  2. demand_agent (LLM)  — gets the memory summary → grounded forecast
+  3. coordinator LLM     — cash posture, then a DETERMINISTIC FLOOR so it
+                           can't starve supply while hoarding cash
+  4. supply_agent (det.) — gets the regime → pre-positions before a surge
+  5. operations_agent (det.)
+  6. serialize Memory back into the single save_notes blob
 
-The coordinator LLM only decides money/risk posture — never domain
-actions — so a bad LLM response degrades to a safe reserve-based rule
-instead of breaking the game. Run: `python -m agents.coordinator`.
+Memory is rebuilt-from-notes every turn (never in-process), so this is
+immune to the parallel-evaluate cross-game hazard. Run:
+  RESTBENCH_DEBUG=1 python -m agents.coordinator --scenario tourist_season
 """
 from __future__ import annotations
 
@@ -22,31 +23,27 @@ import litellm
 
 from agents.runner import run_game
 from agents import demand_agent, supply_agent, operations_agent
+from agents.memory import Memory
 
 MODEL = os.getenv("AGENT_MODEL", "openai/gpt-4.1-mini")
+DEBUG = bool(os.getenv("RESTBENCH_DEBUG"))
 
-# Deterministic fallback budget rule.
 OVERHEAD_DAYS_RESERVE = 6
 MIN_RESERVE = 2500.0
+HARD_RESERVE = 1500.0          # absolute floor we never spend supply below
+SURGE_BUDGET_MULT = 1.6        # extra supply headroom when pre-positioning
 
 COORD_SYSTEM = """\
 You are the financial controller of a restaurant in a 30-day survival
-game. Going bankrupt (cash < 0) is a catastrophic -100,000. Daily fixed
-+ staff overhead is large and unavoidable. You do NOT choose menu,
-orders, or staff — you only set the money envelope and risk posture.
-
-Inputs: cash, days_remaining, yesterday P&L, the demand forecast, what
-supply roughly needs, and marketing the demand manager requested.
+game. Bankruptcy (cash<0) is a catastrophic -100,000. You set only the
+money envelope and risk posture, not menu/orders/staff.
 
 Respond with ONLY this JSON, no prose:
-{
-  "supply_budget": 0,            // EUR supply may spend this turn
-  "marketing_spend": 0,          // 0-500, final approved amount
-  "staff_bias": "lean|normal|safe",
-  "reasoning": "one short sentence"
-}
-Keep enough cash to cover several days of overhead. Late game, you may
-spend down reserves. Early game or low cash, be conservative."""
+{"supply_budget":0,"marketing_spend":0,"staff_bias":"lean|normal|safe",
+ "reasoning":"one short sentence"}
+Withholding ingredient money while sitting on cash causes stockouts that
+lose far more than the cash saved. Fund supply to its need unless cash
+is genuinely tight."""
 
 
 @dataclass
@@ -57,35 +54,41 @@ class BudgetDecision:
     reasoning: str
 
 
-def _fallback_budget(obs: dict, requested_mkt: float) -> BudgetDecision:
+def _rough_supply_estimate(obs: dict, by_dish: dict) -> float:
+    cheapest = {}
+    for s in obs.get("supplier_catalog", []) or []:
+        for ing, price in (s.get("ingredients", {}) or {}).items():
+            cheapest[ing] = min(cheapest.get(ing, 1e9), float(price))
+    total = 0.0
+    for m in obs.get("menu_book", []) or []:
+        units = float(by_dish.get(m.get("name"), 0.0))
+        for c in m.get("ingredients", []) or []:
+            total += (units * float(c.get("quantity_kg", 0.0))
+                      * cheapest.get(c.get("ingredient"), 0.0))
+    return total * 3.0  # ~3 days of cover
+
+
+def _fallback_budget(obs: dict, mkt: float) -> BudgetDecision:
     cash = float(obs.get("cash", 0.0))
     staff = float(obs.get("staff_level", 8))
-    daily_overhead = staff * float(obs.get("staff_cost_per_person", 120.0)) + 300.0
-    reserve = max(MIN_RESERVE, OVERHEAD_DAYS_RESERVE * daily_overhead)
-    return BudgetDecision(
-        supply_budget=max(0.0, cash - reserve),
-        marketing_spend=0.0 if cash < reserve else min(500.0, requested_mkt),
-        staff_bias="normal",
-        reasoning="deterministic reserve rule",
-    )
+    oh = staff * float(obs.get("staff_cost_per_person", 120.0)) + 300.0
+    reserve = max(MIN_RESERVE, OVERHEAD_DAYS_RESERVE * oh)
+    return BudgetDecision(max(0.0, cash - reserve),
+                          0.0 if cash < reserve else min(500.0, mkt),
+                          "normal", "deterministic reserve rule")
 
 
-def _coordinator_llm(obs: dict, demand, est_supply_need: float) -> BudgetDecision:
+def _coordinator_llm(obs: dict, demand) -> BudgetDecision:
     if not (os.environ.get("OPENAI_API_KEY")
             or os.environ.get("ANTHROPIC_API_KEY")):
         return _fallback_budget(obs, demand.requested_marketing)
-    payload = {
-        "cash": obs.get("cash"),
-        "days_remaining": obs.get("days_remaining"),
-        "yesterday_revenue": obs.get("yesterday_revenue"),
-        "yesterday_total_costs": obs.get("yesterday_total_costs"),
-        "cost_breakdown": obs.get("cost_breakdown"),
-        "reputation_band": obs.get("reputation_band"),
-        "forecast_covers": demand.expected_covers,
-        "estimated_supply_need_eur": round(est_supply_need, 2),
-        "requested_marketing": demand.requested_marketing,
-        "alerts": obs.get("alerts"),
-    }
+    payload = {"cash": obs.get("cash"),
+               "days_remaining": obs.get("days_remaining"),
+               "yesterday_revenue": obs.get("yesterday_revenue"),
+               "yesterday_total_costs": obs.get("yesterday_total_costs"),
+               "reputation_band": obs.get("reputation_band"),
+               "forecast_covers": demand.expected_covers,
+               "requested_marketing": demand.requested_marketing}
     try:
         resp = litellm.completion(
             model=MODEL, temperature=0.2, max_tokens=400,
@@ -99,74 +102,66 @@ def _coordinator_llm(obs: dict, demand, est_supply_need: float) -> BudgetDecisio
         d = json.loads(txt)
         cash = float(obs.get("cash", 0.0))
         return BudgetDecision(
-            supply_budget=max(0.0, min(cash, float(d["supply_budget"]))),
-            marketing_spend=max(0.0, min(500.0, float(d.get("marketing_spend", 0)))),
-            staff_bias=str(d.get("staff_bias", "normal")),
-            reasoning=str(d.get("reasoning", "")),
-        )
+            max(0.0, min(cash, float(d["supply_budget"]))),
+            max(0.0, min(500.0, float(d.get("marketing_spend", 0)))),
+            str(d.get("staff_bias", "normal")),
+            str(d.get("reasoning", "")))
     except Exception as e:
         print(f"  [coordinator] LLM fallback: {e}")
         return _fallback_budget(obs, demand.requested_marketing)
 
 
-def _rough_supply_estimate(obs: dict, by_dish: dict) -> float:
-    """Cheap pre-estimate of EUR supply needs, for the coordinator prompt."""
-    cheapest = {}
-    for s in obs.get("supplier_catalog", []) or []:
-        for ing, price in (s.get("ingredients", {}) or {}).items():
-            cheapest[ing] = min(cheapest.get(ing, 1e9), float(price))
-    total = 0.0
-    for m in obs.get("menu_book", []) or []:
-        units = float(by_dish.get(m.get("name"), 0.0))
-        for c in m.get("ingredients", []) or []:
-            total += (units * float(c.get("quantity_kg", 0.0))
-                      * cheapest.get(c.get("ingredient"), 0.0))
-    return total * 2.0  # ~2 days of cover
-
-
 def strategy(observation: dict, day: int) -> list[dict]:
     actions: list[dict] = []
 
-    # 1. Demand (LLM) → forecast everything hangs off.
-    demand = demand_agent.propose(observation, day)
+    # 1. Memory: rebuild from notes (per-game, parallel-safe), update.
+    mem = Memory.from_notes(observation.get("notes"))
+    mem.update(observation, day)
+    regime = mem.regime()
+
+    # 2. Demand (LLM) with grounded memory.
+    demand = demand_agent.propose(observation, day, mem.summary())
     actions += demand.actions
+    mem.record_forecast(demand.expected_covers)
 
-    # 2. Coordinator (LLM) → money envelope + risk posture.
+    # 3. Coordinator LLM posture + DETERMINISTIC FLOOR (kills the doom loop).
+    budget = _coordinator_llm(observation, demand)
+    cash = float(observation.get("cash", 0.0))
     est_need = _rough_supply_estimate(observation, demand.by_dish)
-    budget = _coordinator_llm(observation, demand, est_need)
+    if regime in ("ramp", "surge", "recover"):
+        est_need *= SURGE_BUDGET_MULT
+    floor = min(max(0.0, cash - HARD_RESERVE), est_need)
+    supply_budget = max(budget.supply_budget, floor)
 
-    # 3. Supply (deterministic), bounded by the coordinator's budget.
+    # 4. Supply (det.) — regime-aware pre-positioning.
     supply = supply_agent.propose(observation, day, demand.by_dish,
-                                  budget.supply_budget)
+                                  supply_budget, regime)
     actions += supply.actions
 
-    # 4. Operations (deterministic), sized to the forecast + bias.
+    # 5. Operations (det.).
     ops = operations_agent.propose(observation, day, demand.expected_covers,
                                    budget.staff_bias)
     actions += ops.actions
 
-    # Coordinator owns the single marketing (cash) action.
     if budget.marketing_spend > 0:
         actions.append({"tool": "set_marketing_spend",
                         "args": {"amount": round(budget.marketing_spend, 2)}})
 
-    # 5. Coordinator owns the single notes store.
-    notes = {
-        "day": day,
-        "cash": observation.get("cash"),
-        "forecast_covers": round(demand.expected_covers, 1),
-        "demand_conf": demand.confidence,
-        "supply_spend": supply.spend,
-        "supply_at_risk": supply.at_risk,
-        "expiring": supply.expiring_soon,
-        "staff": ops.staff_level,
-        "service_risk": ops.service_risk,
-        "budget": {"supply": round(budget.supply_budget, 2),
-                   "mkt": round(budget.marketing_spend, 2),
-                   "bias": budget.staff_bias},
-    }
-    actions.append({"tool": "save_notes",
-                    "args": {"text": json.dumps(notes)[:4000]}})
+    # 6. The single notes store IS the serialized memory (bounded).
+    actions.append({"tool": "save_notes", "args": {"text": mem.to_notes()}})
+
+    if DEBUG:
+        print(f"\n===== day {day} cash={observation.get('cash')} "
+              f"regime={regime} bias={mem.bias:.2f} =====")
+        print(f"  DEMAND covers={demand.expected_covers:.0f} "
+              f"conf={demand.confidence} by_dish={demand.by_dish}")
+        print(f"  SUPPLY spend={supply.spend} budget={supply_budget:.0f} "
+              f"(llm={budget.supply_budget:.0f} floor={floor:.0f}) "
+              f"orders={[a['args'] for a in supply.actions]}")
+        print(f"  at_risk={supply.at_risk} expiring={supply.expiring_soon}")
+        print(f"  OPS staff={ops.staff_level} :: {ops.reasoning}")
+        print(f"  mem.covers={mem.covers} peak={mem.peak} "
+              f"starved={mem.starved_days} notes_chars={len(mem.to_notes())}")
     return actions
 
 

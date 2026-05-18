@@ -1,14 +1,25 @@
-"""operations_agent.py — deterministic service / staffing specialist.
+"""operations_agent.py — deterministic service / staffing specialist (v2).
 
 Serves the coordinator. Owns ONLY set_staff_level.
 
-Staff is the single biggest controllable cost (120 EUR/person/day; 8 staff
-= 960/day). The day-1 baseline ran 92 covers on 8 staff with zero wait and
-0.23 table utilisation — heavily overstaffed. So the agent sizes staff to
-the forecast covers, then hill-climbs against yesterday's service signals:
-trim when service was clean and slack, add fast when waits / walkouts /
-kitchen bottlenecks appear (reputation spirals are expensive, so it is
-asymmetric — quick to add, slow to cut). Step-limited to avoid thrashing.
+v2 fixes the bug that caused ~60% of the tourist_season bankruptcy:
+
+  ROOT CAUSE (v1): when the kitchen ran out of food, covers went to 0 and
+  walkouts went to "Many". v1 read "Many walkouts" as "understaffed" and
+  ratcheted staff 5 → 13 into an EMPTY restaurant — ~€9,100 of wages
+  burned serving nobody. Staffing up is the worst possible response to a
+  supply failure.
+
+  FIX 1 — no-service detection: if yesterday's covers were ≈0, the
+  walkouts are a SUPPLY/menu failure, not a service one. Don't add staff;
+  drop to minimum to conserve cash (there is nothing to serve anyway).
+
+  FIX 2 — demand-justified ceiling: the walkout ratchet can NEVER push
+  staff above what the forecast covers justify (+ a small slack). This
+  structurally prevents the 5→13 balloon under any signal combination.
+
+  Also: floor expected_covers by yesterday's actuals (same defensive move
+  as supply), because the LLM forecast is unreliable.
 
 Stateless: reads current staff_level from the observation each turn.
 """
@@ -18,12 +29,14 @@ from dataclasses import dataclass, field
 
 MIN_STAFF, MAX_STAFF = 3, 15
 
-# Covers one staff member can comfortably handle per day. Adjusted by the
-# coordinator's risk bias. ~20 → 90 covers ≈ 5 staff.
+# Covers one staff member handles per day, by coordinator risk bias.
 COVERS_PER_STAFF = {"lean": 24.0, "normal": 20.0, "safe": 16.0}
 
-MAX_STEP = 2          # max staff change per day (anti-thrash)
-PEAK_WAIT_BAD = 10.0  # minutes; above this we were understaffed
+MAX_STEP = 2          # max staff change per day (anti-thrash), increases only
+PEAK_WAIT_BAD = 10.0  # minutes; above this we were genuinely understaffed
+CEILING_SLACK = 3     # most staff allowed ABOVE the demand-justified target
+NO_SERVICE_ABS = 5    # covers at/below this ⇒ effectively no service yesterday
+NO_SERVICE_FRAC = 0.2 # ...or below this fraction of the forecast
 
 
 @dataclass
@@ -41,30 +54,52 @@ def propose(obs: dict, day: int, expected_covers: float,
     cost_per = float(obs.get("staff_cost_per_person", 120.0))
     ss = obs.get("service_summary", {}) or {}
 
-    ratio = COVERS_PER_STAFF.get(staff_bias, COVERS_PER_STAFF["normal"])
-    target = max(MIN_STAFF, round(float(expected_covers) / ratio + 0.5))
-
+    covers_yest = float(ss.get("total_covers") or 0.0)
     walkout = str(ss.get("walkout_band", "None"))
     peak_wait = float(ss.get("peak_wait_minutes", 0.0))
     bottleneck = bool(ss.get("kitchen_bottleneck_hours", []))
     util_peak = float(ss.get("table_utilization_peak", 0.0))
 
-    risk = "low"
-    reason = f"forecast {expected_covers:.0f} covers → target {target}"
+    # Defensive: don't trust an under-forecast — floor by yesterday's actuals.
+    eff_covers = max(float(expected_covers), covers_yest)
 
-    # Asymmetric correction: understaffing signals override the target up.
-    if walkout in ("Some", "Many") or peak_wait > PEAK_WAIT_BAD or bottleneck:
-        target = max(target, cur + 1)
+    ratio = COVERS_PER_STAFF.get(staff_bias, COVERS_PER_STAFF["normal"])
+    demand_target = max(MIN_STAFF, round(eff_covers / ratio + 0.5))
+    ceiling = max(MIN_STAFF, demand_target + CEILING_SLACK)
+
+    # Was yesterday effectively a no-service day? (Only meaningful after day 1.)
+    no_service = day > 1 and covers_yest <= max(
+        NO_SERVICE_ABS, NO_SERVICE_FRAC * float(expected_covers))
+
+    if no_service:
+        # Walkouts here mean NO FOOD, not slow service. Staffing up burns
+        # cash for nothing — go straight to minimum (bypass the down-step
+        # limit; conserving cash now is urgent).
+        target = MIN_STAFF
+        risk = "high"
+        reason = (f"covers≈{covers_yest:.0f}: supply/menu failure, NOT "
+                  f"understaffing — going lean to conserve cash")
+    elif walkout in ("Some", "Many") or peak_wait > PEAK_WAIT_BAD or bottleneck:
+        # Genuine load: we WERE serving and still hit limits.
+        target = max(demand_target, cur + 1)
         risk = "high" if walkout == "Many" else "med"
-        reason += f"; understaffed (walkout={walkout}, peak_wait={peak_wait:.0f})"
+        reason = (f"genuine load (covers={covers_yest:.0f}, "
+                  f"walkout={walkout}, peak_wait={peak_wait:.0f})")
+        target = min(cur + MAX_STEP, target)          # step-limit increases
     elif (walkout == "None" and peak_wait < 2.0 and util_peak < 0.5
-          and cur > target):
-        # Clean + slack: drift down toward target, but only one step.
-        target = cur - 1
-        reason += "; clean & slack, trimming"
+          and cur > demand_target):
+        target = cur - 1                              # clean & slack, trim
+        risk = "low"
+        reason = "clean & slack, trimming"
+    else:
+        target = demand_target
+        risk = "low"
+        reason = f"forecast {expected_covers:.0f} → target {demand_target}"
 
-    # Step-limit + clamp.
-    target = max(cur - MAX_STEP, min(cur + MAX_STEP, target))
+    # HARD demand-justified ceiling: nothing can balloon staff past this.
+    target = min(target, ceiling)
+    if not no_service:
+        target = max(cur - MAX_STEP, target)          # step-limit decreases
     target = max(MIN_STAFF, min(MAX_STAFF, int(target)))
 
     res = OperationsResult(staff_level=target,
