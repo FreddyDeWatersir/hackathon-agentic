@@ -1,4 +1,4 @@
-"""Run all baseline agents and compare scores."""
+"""Run all baseline agents and compare scores. """
 
 from __future__ import annotations
 
